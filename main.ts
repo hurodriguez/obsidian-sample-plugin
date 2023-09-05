@@ -1,134 +1,252 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { Plugin, App, TFile } from "obsidian";
 
-// Remember to rename these classes and interfaces!
+interface Settings {
+  settings: string;
+  withComment: boolean;
+};
 
-interface MyPluginSettings {
-	mySetting: string;
-}
+const DEFAULT_SETTINGS: Settings = {
+  settings: 'default',
+  withComment: false,
+};
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+// Used to identify blocks of tags created by the plugin
+const DELIMETER = "\u200C\u2063";
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+type TagMap = {
+  tag: string,
+  tFile: TFile,
+};
 
-	async onload() {
-		await this.loadSettings();
+export default class AutoTagNestedDirectories extends Plugin {
+  settings: Settings;
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+  /**
+   * Ensure tags match the string requirements for a tag in obsidian markdown
+   * @param preTags
+   * @returns
+   */
+  formatTags(preTags: string[]): string[] {
+    return preTags.map((tag) : string => {
+      return tag.toLocaleLowerCase()
+        .replace('&', 'and')
+        .replace('%', 'mod')
+        .replace('$', 'usd')
+        .replace('£', 'gbp')
+        .replace('#', 'pound')
+        .replace(/[\W_]+/g, ' ')
+        .replace(/\s+/g, '-');
+    });
+  }
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
+  /**
+   * Create the string to be inserted into a markdown file containing tags
+   * @param tags
+   * @returns
+   */
+  createNestedTagString(tags: string[]): string {
+    return tags
+      .map((tag) => `#${tag}`)
+      .join(' ');
+  }
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+  /**
+   * Determine list of tags we should set based on parent dir tree
+   * @param file
+   * @returns
+   */
+  extractUpperDirectories(file: TFile): string[] {
+    return file.path.split('/').slice(0, -1);
+  }
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+  /**
+   * Get an array containing a map of TFile objects to the tag strings
+   * we should write to them
+   * @returns
+   */
+  async mapNestedTagsFromFilePaths(): Promise<TagMap[]> {
+    const markdownFiles = await this.app.vault.getMarkdownFiles();
+    const tagMap = markdownFiles.map((mdFile) => {
+      return {
+        tag: this.createNestedTagString(
+          this.formatTags(
+            this.extractUpperDirectories(mdFile)
+          )
+        ),
+        tFile: mdFile,
+      };
+    });
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
+    return tagMap;
+  }
 
-	onunload() {
+  /**
+   * Given a map of tags to their files, trigger the write operations
+   * for each
+   * @param entries
+   */
+  async writeMappedTags(entries: TagMap[]): Promise<void> {
+    entries.forEach(entry => {
+      this.writeNestedTagToFile(entry.tag, entry.tFile);
+    });
+  }
 
-	}
+  /**
+   * Create the string used appended to the tags to show that this is auto generated
+   * content
+   * @param counter
+   * @returns
+   */
+  createAutoGeneratedComment(counter: Number = 0): string {
+    return `// auto generated |${counter}|`;
+  }
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
+  /**
+   * Check if a given string matches the expected format for a auto-generated
+   * comment
+   * @param comment
+   * @returns
+   */
+  isValidAutoGeneratedComment(comment: string): boolean {
+    return comment.match(/\/\/ auto generated \|\d+\|$/) !== null;
+  }
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
+  /**
+   * Build the block of text to be inserted. Should contain the tag details
+   * and optionally a comment specifying that the content is auto-generated.
+   * @param tag
+   * @returns
+   */
+  constructTagBlock(tag: string): string {
+    const comment = this.createAutoGeneratedComment();
+    let block = `${DELIMETER} ${tag} ${DELIMETER}`;
+    if (this.settings.withComment) {
+      block += `${comment}${DELIMETER}`;
+    }
+    return block;
+  }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+  /**
+   * Check if some text contains an existing auto tag which matches
+   * the expected format
+   * @param text
+   * @returns
+   */
+  async hasExistingTagBlock(text: string): Promise<boolean> {
+    const contentParts = text.split(DELIMETER).filter((part) => {
+      return !part.match(/^\n+$/);
+    });
+    const count = contentParts.length;
+    if (count < 3) {
+      return false;
+    } else {
+      const matchData = contentParts[1].match(/\#[\w\-]+/);
+      if (!matchData) {
+        return false;
+      } else {
+        return true;
+      }
+    }
+  }
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+  /**
+   * Write a new tag to the given TFile. Will either prepend or replace existing,
+   * depending on presence of existing tag
+   * @param tag
+   * @param file
+   */
+  async writeNestedTagToFile(tag: string, file: TFile): Promise<void> {
+    const currentContent = await this.app.vault.read(file);
+    const tagBlock = this.constructTagBlock(tag);
+    const locatedExistingTagBlock = await this.hasExistingTagBlock(currentContent);
+    if (!locatedExistingTagBlock) {
+      await this.prependTag(tagBlock, currentContent, file);
+    } else {
+      await this.replaceTag(tagBlock, currentContent, file);
+    }
+  }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
+  /**
+   * Prepend Nested Tag string to front of file. Warning: This can be quite intesive
+   * for very large files as it involved copying all content.
+   * @param tag
+   * @param currentContent
+   * @param file
+   */
+  async prependTag(tag: string, currentContent: string, file: TFile): Promise<void> {
+    await this.app.vault.modify(file, `${tag}\n\n${currentContent}`);
+  }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+  /**
+   * Replace existing tag-like structure with new tag
+   * @param tag
+   * @param currentText
+   * @param file
+   */
+  async replaceTag(tag: string, currentText: string, file: TFile): Promise<void> {
+    const parts = currentText.split(DELIMETER).filter((part) => {
+      return !part.match(/^\n+$/);
+    });
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    // modify main tag
+    parts[1] = tag.split(DELIMETER)[1];
 
-	display(): void {
-		const {containerEl} = this;
+    // try to update the auto generated counter
+    if (this.isValidAutoGeneratedComment(parts[2])) {
+      // if we have a comment but setting was since toggled off, set to ''
+      if (!this.settings.withComment) {
+        parts[2] = '';
+      } else {
+        const commentParts = parts[2].split(/[\|\|]/);
+        if (commentParts.length === 3) {
+          // incrementer from comment - show how many times we've updated it
+          let currentCounter = parseInt(commentParts[1], 10);
+          currentCounter += 1;
+          parts[2] = this.createAutoGeneratedComment(currentCounter);
+        }
+      }
+    } else if (this.settings.withComment) {
+      // add a comment if there isn't one currently but setting is on
+      parts.splice(2, 0, this.createAutoGeneratedComment(0));
+    }
 
-		containerEl.empty();
+    // join parts again and write
+    await this.app.vault.modify(file, parts.join(DELIMETER));
+  }
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
-}
+  /**
+   * Remove tag from a file.
+   * May have unforeseeable consequences if tags have been manually edited.
+   * @param currentText
+   * @param file
+   */
+  async removeTag(currentText: string, file: TFile): Promise<void> {
+    if (await this.hasExistingTagBlock(currentText)) {
+      const parts = currentText.split(DELIMETER).filter((part) => {
+        return !part.match(/^\n+$/);
+      });
+      if (parts.length > 1) {
+        // remove all inner parts that belong to the tag
+        const contentToWrite = parts[0] + parts[parts.length - 1].trimStart();
+        await this.app.vault.modify(file, contentToWrite);
+      }
+    }
+  }
+
+  async onload(): Promise<void> {
+    await this.loadSettings();
+    // const tagMap = await this.mapNestedTagsFromFilePaths();
+
+    // tagMap.forEach((entry) => {
+    //   this.writeNestedTagToFile(entry.tag, entry.tFile);
+    // });
+  }
+};
